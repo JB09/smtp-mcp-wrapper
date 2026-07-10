@@ -5,14 +5,13 @@
 
 services:
   email-mcp:
-    image: ${IMAGE:-ghcr.io/OWNER/smtp-mcp-wrapper:latest}
+    image: ${IMAGE:-ghcr.io/jb09/smtp-mcp-wrapper:latest}
     container_name: ${CONTAINER_NAME:-email-mcp}
     restart: unless-stopped
     env_file: .env
-    # No `ports:` on purpose — do not bind a public interface. The authorization
-    # proxy reaches the server over the internal `proxy` network below.
-    expose:
-      - "8080"
+    # No published `ports:` on purpose — do not bind a public interface. The
+    # authorization proxy reaches the server by container name over the internal
+    # `proxy` network below; the app listens on port 8080.
     networks:
       - proxy
     labels:
