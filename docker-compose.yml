@@ -5,7 +5,7 @@
 
 services:
   email-mcp:
-    image: ${IMAGE:-ghcr.io/OWNER/smtp-mcp-wrapper:latest}
+    image: ${IMAGE:-ghcr.io/jb09/smtp-mcp-wrapper:latest}
     container_name: ${CONTAINER_NAME:-email-mcp}
     restart: unless-stopped
     env_file: .env
