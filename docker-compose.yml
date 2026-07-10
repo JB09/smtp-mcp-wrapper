@@ -1,0 +1,35 @@
+# Deploy compose. Everything environment-specific is read from the environment /
+# .env so this file is safe to publish. The container is NEVER exposed on a host
+# port: it is reachable only from the proxy network, and an identity-aware
+# authorization proxy (e.g. Pomerium) must front it. See README.md.
+
+services:
+  email-mcp:
+    image: ${IMAGE:-ghcr.io/OWNER/smtp-mcp-wrapper:latest}
+    container_name: ${CONTAINER_NAME:-email-mcp}
+    restart: unless-stopped
+    env_file: .env
+    # No `ports:` on purpose — do not bind a public interface. The authorization
+    # proxy reaches the server over the internal `proxy` network below.
+    expose:
+      - "8080"
+    networks:
+      - proxy
+    labels:
+      # Opt in to Watchtower so weekly CI rebuilds are pulled automatically.
+      - "com.centurylinklabs.watchtower.enable=true"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz').read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-pomerium}
