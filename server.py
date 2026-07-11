@@ -33,9 +33,26 @@ DEFAULT_TO = os.environ.get("DEFAULT_TO", "")
 ALLOWED_TO = [a.strip().lower() for a in os.environ.get("ALLOWED_TO", "").split(",") if a.strip()]
 
 # Optional app-layer backstop. The external proxy is still REQUIRED regardless.
+# When enabled, /mcp requests must carry a Pomerium identity assertion whose JWT
+# is cryptographically verified (signature + exp + audience) against Pomerium's
+# JWKS — this blocks anything on the shared network that tries to reach the app
+# directly, bypassing Pomerium.
 REQUIRE_POMERIUM_IDENTITY = os.environ.get("REQUIRE_POMERIUM_IDENTITY", "false").lower() == "true"
-# Header Pomerium sets on authenticated requests (JWT assertion of the identity).
-POMERIUM_IDENTITY_HEADER = os.environ.get("POMERIUM_IDENTITY_HEADER", "x-pomerium-jwt-assertion")
+# Candidate header(s) carrying the assertion JWT. Pomerium's MCP mode uses
+# `x-pomerium-assertion`; the general identity header is `x-pomerium-jwt-assertion`.
+POMERIUM_IDENTITY_HEADER = os.environ.get(
+    "POMERIUM_IDENTITY_HEADER", "x-pomerium-assertion,x-pomerium-jwt-assertion"
+)
+POMERIUM_ASSERTION_HEADERS = [
+    h.strip().lower() for h in POMERIUM_IDENTITY_HEADER.split(",") if h.strip()
+]
+# Pomerium's JWKS endpoint (its signing key's public keys), e.g.
+# https://<route-host>/.well-known/pomerium/jwks.json. Required when the gate is on.
+POMERIUM_JWKS_URL = os.environ.get("POMERIUM_JWKS_URL", "")
+# Expected `aud`/`iss` claims. `aud` is the route's upstream URL/host; verified
+# when set. `iss` verified only when set.
+POMERIUM_AUDIENCE = os.environ.get("POMERIUM_AUDIENCE", "")
+POMERIUM_ISSUER = os.environ.get("POMERIUM_ISSUER", "")
 
 # Send a one-off test email on startup to verify the SMTP configuration. On
 # failure the error is logged verbosely (SMTP transcript + traceback) and the
@@ -185,22 +202,83 @@ async def healthz(_request: Request) -> PlainTextResponse:
     return PlainTextResponse("ok")
 
 
-def _run_with_identity_gate() -> None:
-    """Serve the MCP app with an app-layer Pomerium-identity requirement on /mcp.
+_jwks_client = None  # lazily constructed jwt.PyJWKClient (caches signing keys)
 
-    This is defense-in-depth only; the external authorization proxy remains the
-    primary and required gate. `/healthz` stays open so healthchecks keep working.
+
+def _get_jwks_client():
+    global _jwks_client
+    if _jwks_client is None:
+        import jwt  # PyJWT
+
+        _jwks_client = jwt.PyJWKClient(POMERIUM_JWKS_URL)
+    return _jwks_client
+
+
+def _extract_assertion(headers) -> str | None:
+    """Return the first present Pomerium assertion header value, else None."""
+    for name in POMERIUM_ASSERTION_HEADERS:
+        value = headers.get(name)
+        if value:
+            return value
+    return None
+
+
+def _verify_assertion(token: str) -> None:
+    """Verify Pomerium's assertion JWT: signature (ES256) + exp + optional aud/iss.
+
+    Raises on any failure (bad/expired/forged token). Runs sync network I/O to the
+    JWKS endpoint on first use, then serves cached keys.
+    """
+    import jwt  # PyJWT
+
+    signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
+    jwt.decode(
+        token,
+        signing_key.key,
+        algorithms=["ES256"],
+        audience=POMERIUM_AUDIENCE or None,
+        issuer=POMERIUM_ISSUER or None,
+        options={
+            "require": ["exp"],
+            "verify_aud": bool(POMERIUM_AUDIENCE),
+            "verify_iss": bool(POMERIUM_ISSUER),
+        },
+    )
+
+
+def _run_with_identity_gate() -> None:
+    """Serve the MCP app, cryptographically verifying Pomerium's identity on /mcp.
+
+    Defense-in-depth: the external proxy remains the primary gate. Every /mcp
+    request must carry a Pomerium assertion whose JWT verifies against Pomerium's
+    JWKS; otherwise it is rejected with 401. `/healthz` stays open for healthchecks.
     """
     import uvicorn
+    from starlette.concurrency import run_in_threadpool
     from starlette.middleware.base import BaseHTTPMiddleware
 
     app = mcp.streamable_http_app()
 
     async def require_identity(request: Request, call_next):
-        if request.url.path.startswith("/mcp") and not request.headers.get(POMERIUM_IDENTITY_HEADER):
-            return PlainTextResponse(
-                "Missing authorization proxy identity header.", status_code=401
-            )
+        if request.url.path.startswith("/mcp"):
+            token = _extract_assertion(request.headers)
+            if not token:
+                logger.warning("Rejected /mcp request: missing Pomerium assertion header.")
+                return PlainTextResponse(
+                    "Missing authorization proxy identity header.", status_code=401
+                )
+            try:
+                await run_in_threadpool(_verify_assertion, token)
+            except Exception as exc:
+                # Log the reason (expired / bad signature / wrong audience), never the token.
+                logger.warning(
+                    "Rejected /mcp request: invalid Pomerium assertion — %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                return PlainTextResponse(
+                    "Invalid authorization proxy identity.", status_code=401
+                )
         return await call_next(request)
 
     app.add_middleware(BaseHTTPMiddleware, dispatch=require_identity)
@@ -217,6 +295,14 @@ if __name__ == "__main__":
         _send_startup_test_email()
 
     if REQUIRE_POMERIUM_IDENTITY:
+        if not POMERIUM_JWKS_URL:
+            logger.error(
+                "REQUIRE_POMERIUM_IDENTITY=true but POMERIUM_JWKS_URL is not set. "
+                "The gate cannot verify assertions; refusing to start. Set POMERIUM_JWKS_URL "
+                "(e.g. https://<route-host>/.well-known/pomerium/jwks.json) and "
+                "POMERIUM_AUDIENCE, or set REQUIRE_POMERIUM_IDENTITY=false."
+            )
+            raise SystemExit(1)
         _run_with_identity_gate()
     else:
         mcp.run(transport="streamable-http")
