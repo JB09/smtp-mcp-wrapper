@@ -33,9 +33,11 @@ except through the authorization proxy.
 
 - `ALLOWED_TO` hard-limits recipients, so even a misused tool cannot mail outside the
   allowlist.
-- Setting `REQUIRE_POMERIUM_IDENTITY=true` makes the app itself reject `/mcp` requests
-  that arrive without a Pomerium identity header (`x-pomerium-jwt-assertion` by default) — a
-  backstop in case the proxy is ever misconfigured or bypassed.
+- Setting `REQUIRE_POMERIUM_IDENTITY=true` makes the app **cryptographically verify**
+  Pomerium's identity assertion on every `/mcp` request — signature (against Pomerium's
+  JWKS), expiry, and audience. This blocks anything on the shared Docker network from
+  reaching the app directly and bypassing Pomerium. See
+  [Enabling app-layer verification](#enabling-app-layer-verification).
 
 ## Configuration
 
@@ -55,8 +57,11 @@ the published container image can safely be public.
 | `DEFAULT_TO` | — | Recipient used when the tool's `to` argument is omitted. |
 | `ALLOWED_TO` | — | Comma-separated recipient allowlist. Empty = any recipient allowed. |
 | `STARTUP_TEST_EMAIL` | `false` | Send a test email to `DEFAULT_TO` on startup to verify SMTP. On failure, logs the SMTP error reason (auth/connection); the server keeps running either way. |
-| `REQUIRE_POMERIUM_IDENTITY` | `false` | Also enforce a Pomerium identity header at the app layer. |
-| `POMERIUM_IDENTITY_HEADER` | `x-pomerium-jwt-assertion` | Header checked when the above is `true`. |
+| `REQUIRE_POMERIUM_IDENTITY` | `false` | Verify Pomerium's identity assertion on every `/mcp` request (see below). Requires `POMERIUM_JWKS_URL`. |
+| `POMERIUM_JWKS_URL` | — | Pomerium's JWKS endpoint, e.g. `https://<host>/.well-known/pomerium/jwks.json`. Required when the gate is on. |
+| `POMERIUM_AUDIENCE` | — | Expected `aud` claim (the route host/URL). Verified when set — strongly recommended. |
+| `POMERIUM_ISSUER` | — | Expected `iss` claim. Verified only when set. |
+| `POMERIUM_IDENTITY_HEADER` | `x-pomerium-assertion,x-pomerium-jwt-assertion` | Comma-separated header(s) carrying the assertion JWT. |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Server bind address/port. |
 
 ### The `send_email` tool
@@ -67,6 +72,45 @@ send_email(subject: str, html: str, to?: str, text?: str) -> str
 
 Sends an HTML email. `to` falls back to `DEFAULT_TO` and must be within `ALLOWED_TO` when
 that allowlist is set. `text` is an optional plain-text alternative for non-HTML clients.
+
+## Enabling app-layer verification
+
+This step is **optional** — Pomerium already gates all access. Enable it only if you also
+want the app to reject any request that reaches it *without* a valid Pomerium identity
+(e.g. a compromised neighbor on the shared Docker network hitting `email-mcp:8080`
+directly). When on, the app verifies the assertion JWT's signature, expiry, and audience.
+
+**1. Pomerium — set these on the `email-mcp` route.** The critical addition is
+`pass_identity_headers: true`; without it Pomerium forwards no identity header and the app
+rejects every request. Pomerium must also have a **signing key** configured (it serves the
+matching public keys at `/.well-known/pomerium/jwks.json`).
+
+```yaml
+routes:
+  - from: https://email-mcp.example.com
+    to: http://email-mcp:8080        # pathless — the /mcp path passes through
+    name: email-mcp
+    mcp:
+      server: {}
+    pass_identity_headers: true       # <-- REQUIRED: sends X-Pomerium-Assertion to the app
+    policy:
+      - allow:
+          and:
+            - email:
+                is: you@example.com
+```
+
+**2. App — set these in `.env`:**
+
+```sh
+REQUIRE_POMERIUM_IDENTITY=true
+POMERIUM_JWKS_URL=https://email-mcp.example.com/.well-known/pomerium/jwks.json
+POMERIUM_AUDIENCE=email-mcp.example.com
+```
+
+Then `docker compose up -d`. If `REQUIRE_POMERIUM_IDENTITY=true` but `POMERIUM_JWKS_URL` is
+unset, the server refuses to start (a security gate must not run unable to verify). To turn
+the feature off again, set `REQUIRE_POMERIUM_IDENTITY=false`.
 
 ## Run
 

@@ -23,7 +23,10 @@ services:
       ALLOWED_TO: ${ALLOWED_TO:-}
       STARTUP_TEST_EMAIL: ${STARTUP_TEST_EMAIL:-false}
       REQUIRE_POMERIUM_IDENTITY: ${REQUIRE_POMERIUM_IDENTITY:-false}
-      POMERIUM_IDENTITY_HEADER: ${POMERIUM_IDENTITY_HEADER:-x-pomerium-jwt-assertion}
+      POMERIUM_IDENTITY_HEADER: ${POMERIUM_IDENTITY_HEADER:-x-pomerium-assertion,x-pomerium-jwt-assertion}
+      POMERIUM_JWKS_URL: ${POMERIUM_JWKS_URL:-}
+      POMERIUM_AUDIENCE: ${POMERIUM_AUDIENCE:-}
+      POMERIUM_ISSUER: ${POMERIUM_ISSUER:-}
     # No published `ports:` on purpose — do not bind a public interface. The
     # authorization proxy reaches the server by container name over the internal
     # `proxy` network below; the app listens on port 8080.
