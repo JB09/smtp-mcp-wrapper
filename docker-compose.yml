@@ -1,6 +1,7 @@
-# Deploy compose. Everything environment-specific is read from the environment /
-# .env so this file is safe to publish. The container is NEVER exposed on a host
-# port: it is reachable only from the proxy network, and an identity-aware
+# Deploy compose. Every value is interpolated from the environment (Compose also
+# auto-loads a sibling `.env` for these `${...}` substitutions), so this file is
+# safe to publish — no secrets are hard-coded. The container is NEVER exposed on
+# a host port: it is reachable only from the proxy network, and an identity-aware
 # authorization proxy (e.g. Pomerium) must front it. See README.md.
 
 services:
@@ -8,7 +9,20 @@ services:
     image: ${IMAGE:-ghcr.io/jb09/smtp-mcp-wrapper:latest}
     container_name: ${CONTAINER_NAME:-email-mcp}
     restart: unless-stopped
-    env_file: .env
+    # Each variable is set explicitly so exactly what the app receives is visible
+    # here. Values come from the host environment / sibling `.env`. Defaults match
+    # server.py; required secrets have none and must be provided.
+    environment:
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:?SMTP_USER is required}
+      SMTP_PASS: ${SMTP_PASS:?SMTP_PASS is required}
+      MAIL_FROM: ${MAIL_FROM:-}
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-}
+      DEFAULT_TO: ${DEFAULT_TO:-}
+      ALLOWED_TO: ${ALLOWED_TO:-}
+      REQUIRE_POMERIUM_IDENTITY: ${REQUIRE_POMERIUM_IDENTITY:-false}
+      POMERIUM_IDENTITY_HEADER: ${POMERIUM_IDENTITY_HEADER:-x-pomerium-jwt-assertion}
     # No published `ports:` on purpose — do not bind a public interface. The
     # authorization proxy reaches the server by container name over the internal
     # `proxy` network below; the app listens on port 8080.
