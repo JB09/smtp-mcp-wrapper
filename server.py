@@ -10,6 +10,7 @@ Configuration is entirely via environment variables (see .env.example).
 
 from __future__ import annotations
 
+import logging
 import os
 import smtplib
 from email.message import EmailMessage
@@ -18,6 +19,8 @@ from email.utils import formataddr
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
+
+logger = logging.getLogger("email-mcp")
 
 # --- Configuration (all from env; secrets injected at runtime, never baked in) ---
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
@@ -34,31 +37,28 @@ REQUIRE_POMERIUM_IDENTITY = os.environ.get("REQUIRE_POMERIUM_IDENTITY", "false")
 # Header Pomerium sets on authenticated requests (JWT assertion of the identity).
 POMERIUM_IDENTITY_HEADER = os.environ.get("POMERIUM_IDENTITY_HEADER", "x-pomerium-jwt-assertion")
 
+# Send a one-off test email on startup to verify the SMTP configuration. On
+# failure the error is logged verbosely (SMTP transcript + traceback) and the
+# server keeps running.
+STARTUP_TEST_EMAIL = os.environ.get("STARTUP_TEST_EMAIL", "false").lower() == "true"
+
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 
 mcp = FastMCP("email-mcp", host=HOST, port=PORT)
 
 
-@mcp.tool()
-def send_email(
+def _send_email(
     subject: str,
     html: str,
     to: str | None = None,
     text: str | None = None,
+    debug: bool = False,
 ) -> str:
-    """Send an HTML email via the configured SMTP relay.
+    """Send an HTML email via the configured SMTP relay and return the recipient.
 
-    Args:
-        subject: The email subject line.
-        html: The HTML body of the email.
-        to: Recipient address. Falls back to DEFAULT_TO when omitted. Must be in
-            the ALLOWED_TO allowlist when one is configured.
-        text: Optional plain-text alternative body. A generic placeholder is used
-            when omitted so non-HTML clients still see something sensible.
-
-    Returns:
-        A short confirmation string naming the recipient.
+    Shared by the `send_email` tool and the optional startup test. When `debug`
+    is set, the full SMTP conversation is emitted (useful for diagnosing failures).
     """
     recipient = (to or DEFAULT_TO).strip()
     if not recipient:
@@ -82,11 +82,63 @@ def send_email(
     msg.add_alternative(html, subtype="html")
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+        if debug:
+            server.set_debuglevel(1)
         server.starttls()
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
 
+    return recipient
+
+
+@mcp.tool()
+def send_email(
+    subject: str,
+    html: str,
+    to: str | None = None,
+    text: str | None = None,
+) -> str:
+    """Send an HTML email via the configured SMTP relay.
+
+    Args:
+        subject: The email subject line.
+        html: The HTML body of the email.
+        to: Recipient address. Falls back to DEFAULT_TO when omitted. Must be in
+            the ALLOWED_TO allowlist when one is configured.
+        text: Optional plain-text alternative body. A generic placeholder is used
+            when omitted so non-HTML clients still see something sensible.
+
+    Returns:
+        A short confirmation string naming the recipient.
+    """
+    recipient = _send_email(subject, html, to, text)
     return f"Email sent to {recipient}."
+
+
+def _send_startup_test_email() -> None:
+    """Send a one-off test email at startup to verify SMTP config.
+
+    Never raises: on failure it logs the error verbosely (SMTP transcript from
+    `set_debuglevel` plus a full traceback) so the container logs show exactly
+    why sending failed, then lets the server start anyway.
+    """
+    logger.info("STARTUP_TEST_EMAIL enabled — sending startup test email...")
+    try:
+        recipient = _send_email(
+            subject="email-mcp startup test",
+            html="<p>✅ The <strong>email-mcp</strong> server started and can send mail.</p>",
+            text="The email-mcp server started and can send mail.",
+            debug=True,
+        )
+        logger.info("Startup test email sent successfully to %s.", recipient)
+    except Exception:
+        logger.exception(
+            "Startup test email FAILED (SMTP_HOST=%s, SMTP_PORT=%s, SMTP_USER=%s). "
+            "The server will keep running; fix the SMTP configuration and restart to retest.",
+            SMTP_HOST,
+            SMTP_PORT,
+            SMTP_USER or "<unset>",
+        )
 
 
 @mcp.custom_route("/healthz", methods=["GET"])
@@ -118,6 +170,14 @@ def _run_with_identity_gate() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    if STARTUP_TEST_EMAIL:
+        _send_startup_test_email()
+
     if REQUIRE_POMERIUM_IDENTITY:
         _run_with_identity_gate()
     else:

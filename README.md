@@ -54,6 +54,7 @@ the published container image can safely be public.
 | `MAIL_FROM_NAME` | — | Optional display name for the From header. |
 | `DEFAULT_TO` | — | Recipient used when the tool's `to` argument is omitted. |
 | `ALLOWED_TO` | — | Comma-separated recipient allowlist. Empty = any recipient allowed. |
+| `STARTUP_TEST_EMAIL` | `false` | Send a test email to `DEFAULT_TO` on startup to verify SMTP. Logs verbosely on failure; the server keeps running either way. |
 | `REQUIRE_POMERIUM_IDENTITY` | `false` | Also enforce a Pomerium identity header at the app layer. |
 | `POMERIUM_IDENTITY_HEADER` | `x-pomerium-jwt-assertion` | Header checked when the above is `true`. |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Server bind address/port. |
