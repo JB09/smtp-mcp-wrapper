@@ -32,7 +32,7 @@ ALLOWED_TO = [a.strip().lower() for a in os.environ.get("ALLOWED_TO", "").split(
 # Optional app-layer backstop. The external proxy is still REQUIRED regardless.
 REQUIRE_POMERIUM_IDENTITY = os.environ.get("REQUIRE_POMERIUM_IDENTITY", "false").lower() == "true"
 # Header Pomerium sets on authenticated requests (JWT assertion of the identity).
-POMERIUM_IDENTITY_HEADER = os.environ.get("POMERIUM_IDENTITY_HEADER", "x-pomerium-assertion")
+POMERIUM_IDENTITY_HEADER = os.environ.get("POMERIUM_IDENTITY_HEADER", "x-pomerium-jwt-assertion")
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))

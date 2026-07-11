@@ -34,7 +34,7 @@ except through the authorization proxy.
 - `ALLOWED_TO` hard-limits recipients, so even a misused tool cannot mail outside the
   allowlist.
 - Setting `REQUIRE_POMERIUM_IDENTITY=true` makes the app itself reject `/mcp` requests
-  that arrive without a Pomerium identity header (`x-pomerium-assertion` by default) — a
+  that arrive without a Pomerium identity header (`x-pomerium-jwt-assertion` by default) — a
   backstop in case the proxy is ever misconfigured or bypassed.
 
 ## Configuration
@@ -55,7 +55,7 @@ the published container image can safely be public.
 | `DEFAULT_TO` | — | Recipient used when the tool's `to` argument is omitted. |
 | `ALLOWED_TO` | — | Comma-separated recipient allowlist. Empty = any recipient allowed. |
 | `REQUIRE_POMERIUM_IDENTITY` | `false` | Also enforce a Pomerium identity header at the app layer. |
-| `POMERIUM_IDENTITY_HEADER` | `x-pomerium-assertion` | Header checked when the above is `true`. |
+| `POMERIUM_IDENTITY_HEADER` | `x-pomerium-jwt-assertion` | Header checked when the above is `true`. |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Server bind address/port. |
 
 ### The `send_email` tool
