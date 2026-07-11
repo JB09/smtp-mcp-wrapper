@@ -48,17 +48,16 @@ PORT = int(os.environ.get("PORT", "8080"))
 mcp = FastMCP("email-mcp", host=HOST, port=PORT)
 
 
-def _send_email(
+def _build_message(
     subject: str,
     html: str,
     to: str | None = None,
     text: str | None = None,
-    debug: bool = False,
-) -> str:
-    """Send an HTML email via the configured SMTP relay and return the recipient.
+) -> tuple[str, EmailMessage]:
+    """Validate inputs and construct the email. Returns (recipient, message).
 
-    Shared by the `send_email` tool and the optional startup test. When `debug`
-    is set, the full SMTP conversation is emitted (useful for diagnosing failures).
+    Raises on config/validation problems (missing recipient, disallowed
+    recipient, missing credentials) — i.e. everything *before* the network.
     """
     recipient = (to or DEFAULT_TO).strip()
     if not recipient:
@@ -81,14 +80,43 @@ def _send_email(
     msg.set_content(text or "This message requires an HTML-capable email client.")
     msg.add_alternative(html, subtype="html")
 
+    return recipient, msg
+
+
+def _deliver(recipient: str, msg: EmailMessage) -> None:
+    """Open the SMTP connection and send the message (the network phase)."""
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        if debug:
-            server.set_debuglevel(1)
         server.starttls()
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
 
+
+def _send_email(
+    subject: str,
+    html: str,
+    to: str | None = None,
+    text: str | None = None,
+) -> str:
+    """Build and send an HTML email via the configured SMTP relay; return recipient."""
+    recipient, msg = _build_message(subject, html, to, text)
+    _deliver(recipient, msg)
     return recipient
+
+
+def _describe_smtp_error(exc: Exception) -> str:
+    """Summarize why an SMTP send failed, without dumping the message.
+
+    smtplib auth/response errors carry the server's reply code and text (e.g.
+    535 'Username and Password not accepted' for a wrong user / unauthorized);
+    connection errors surface as OSError. This extracts just that reason.
+    """
+    code = getattr(exc, "smtp_code", None)
+    smtp_error = getattr(exc, "smtp_error", None)
+    if smtp_error is not None:
+        if isinstance(smtp_error, bytes):
+            smtp_error = smtp_error.decode("utf-8", "replace")
+        return f"{type(exc).__name__} ({code}): {smtp_error}"
+    return f"{type(exc).__name__}: {exc}"
 
 
 @mcp.tool()
@@ -118,27 +146,37 @@ def send_email(
 def _send_startup_test_email() -> None:
     """Send a one-off test email at startup to verify SMTP config.
 
-    Never raises: on failure it logs the error verbosely (SMTP transcript from
-    `set_debuglevel` plus a full traceback) so the container logs show exactly
-    why sending failed, then lets the server start anyway.
+    Never raises. Message construction is not logged; only the SMTP send is
+    diagnosed on failure (auth/connection reason — wrong user, unauthorized,
+    connection refused, etc.), then the server starts anyway.
     """
     logger.info("STARTUP_TEST_EMAIL enabled — sending startup test email...")
+
     try:
-        recipient = _send_email(
+        recipient, msg = _build_message(
             subject="email-mcp startup test",
             html="<p>✅ The <strong>email-mcp</strong> server started and can send mail.</p>",
             text="The email-mcp server started and can send mail.",
-            debug=True,
         )
-        logger.info("Startup test email sent successfully to %s.", recipient)
-    except Exception:
-        logger.exception(
-            "Startup test email FAILED (SMTP_HOST=%s, SMTP_PORT=%s, SMTP_USER=%s). "
-            "The server will keep running; fix the SMTP configuration and restart to retest.",
+    except Exception as exc:
+        logger.error("Startup test email skipped — invalid configuration: %s", exc)
+        return
+
+    try:
+        _deliver(recipient, msg)
+    except Exception as exc:
+        logger.error(
+            "Startup test email FAILED to send to %s via %s:%s as %s — %s. "
+            "The server will keep running; fix the SMTP settings and restart to retest.",
+            recipient,
             SMTP_HOST,
             SMTP_PORT,
             SMTP_USER or "<unset>",
+            _describe_smtp_error(exc),
         )
+        return
+
+    logger.info("Startup test email sent successfully to %s.", recipient)
 
 
 @mcp.custom_route("/healthz", methods=["GET"])
