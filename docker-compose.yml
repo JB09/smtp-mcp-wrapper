@@ -21,6 +21,7 @@ services:
       MAIL_FROM_NAME: ${MAIL_FROM_NAME:-}
       DEFAULT_TO: ${DEFAULT_TO:-}
       ALLOWED_TO: ${ALLOWED_TO:-}
+      STARTUP_TEST_EMAIL: ${STARTUP_TEST_EMAIL:-false}
       REQUIRE_POMERIUM_IDENTITY: ${REQUIRE_POMERIUM_IDENTITY:-false}
       POMERIUM_IDENTITY_HEADER: ${POMERIUM_IDENTITY_HEADER:-x-pomerium-jwt-assertion}
     # No published `ports:` on purpose — do not bind a public interface. The
