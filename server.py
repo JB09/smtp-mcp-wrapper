@@ -17,6 +17,7 @@ from email.message import EmailMessage
 from email.utils import formataddr
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
@@ -136,7 +137,16 @@ def _describe_smtp_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-@mcp.tool()
+# Tool annotation. Clients (e.g. Claude's connector settings) use these hints to
+# group tools as read vs write and to decide what warrants confirmation. Sending
+# is a write, not destructive, and not idempotent (each call sends another email);
+# openWorldHint is true because it talks to an external SMTP server.
+SEND = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+)
+
+
+@mcp.tool(annotations=SEND)
 def send_email(
     subject: str,
     html: str,
