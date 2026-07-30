@@ -46,13 +46,31 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
 
+      # Build to the local daemon first so the image can be exercised before it
+      # is published. A build-only gate cannot catch the failures that matter
+      # here: a server bound to the wrong interface, or a DNS-rebinding
+      # allowlist that rejects the proxy, both build clean and report healthy.
+      - name: Build image for testing
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          # Refresh everything on the weekly scheduled rebuild.
+          no-cache: ${{ github.event_name == 'schedule' }}
+          tags: email-mcp:ci
+
+      - name: Smoke test (real MCP handshake + Host guard)
+        run: ./scripts/smoke_test.sh email-mcp:ci
+
+      # Re-runs against the same builder cache, so this is a tag-and-push, not a
+      # second build. Only a smoke-tested image ever reaches the registry.
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: .
-          # Push everywhere except PRs, where we only validate that the image builds.
+          # Push everywhere except PRs, where we only validate the image.
           push: ${{ github.event_name != 'pull_request' }}
-          # Refresh everything on the weekly scheduled rebuild.
           no-cache: ${{ github.event_name == 'schedule' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+#
+# Smoke-test a built image by driving REAL MCP traffic against it.
+#
+#   scripts/smoke_test.sh <image-ref>
+#
+# `docker build` succeeding proves almost nothing about this server: the two
+# ways an MCP SDK upgrade breaks it — binding the wrong interface, and the
+# DNS-rebinding guard rejecting the proxy's `Host` — both produce an image that
+# builds, starts, and reports **healthy** while every tool call fails. `/healthz`
+# is not behind the guard, so it stays 200 throughout. Only a real
+# `initialize` + `tools/list` over a non-localhost `Host` catches them.
+#
+# Phase 1 — the default (guard off) posture: the server is reachable from
+#           outside its own loopback and advertises the expected tools.
+# Phase 2 — the production posture: with MCP_ALLOWED_HOSTS set, the allowlisted
+#           Host is accepted AND a foreign one is rejected with 421.
+
+set -euo pipefail
+
+IMAGE="${1:?usage: smoke_test.sh <image-ref>}"
+
+CONTAINER="${SMOKE_CONTAINER:-email-mcp-smoke}"
+PORT="${SMOKE_PORT:-18080}"
+BASE="http://127.0.0.1:${PORT}"
+# The Host header the container is expected to see in deployment: proxies
+# generally rewrite it to the upstream address rather than the public route.
+ROUTE_HOST="${SMOKE_ROUTE_HOST:-email-mcp:8080}"
+FOREIGN_HOST="not-allowed.example:8080"
+EXPECTED_TOOLS=("send_email")
+
+failures=0
+
+log()  { printf '\n=== %s\n' "$*"; }
+pass() { printf '  ok   %s\n' "$*"; }
+fail() { printf '  FAIL %s\n' "$*"; failures=$((failures + 1)); }
+
+cleanup() { docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+start_container() {
+  cleanup
+  # Credentials are dummies on purpose — no phase sends mail, and STARTUP_TEST_EMAIL
+  # stays off so the container never touches an SMTP server.
+  docker run -d --name "$CONTAINER" \
+    -p "127.0.0.1:${PORT}:8080" \
+    -e SMTP_USER=smoke@example.com \
+    -e SMTP_PASS=not-a-real-password \
+    -e DEFAULT_TO=smoke@example.com \
+    -e STARTUP_TEST_EMAIL=false \
+    "$@" \
+    "$IMAGE" >/dev/null
+
+  for _ in $(seq 1 30); do
+    if curl -fsS "${BASE}/healthz" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+
+  echo "container never became healthy; logs:" >&2
+  docker logs "$CONTAINER" >&2 || true
+  exit 1
+}
+
+# POST an MCP request with an explicit Host header. Writes the body to $BODY and
+# the response headers to $HEADERS; echoes the status code.
+BODY=$(mktemp)
+HEADERS=$(mktemp)
+mcp_post() {
+  local host="$1" payload="$2" session="${3:-}"
+  local args=(-s -o "$BODY" -D "$HEADERS" -w '%{http_code}'
+    -X POST "${BASE}/mcp"
+    -H "Host: ${host}"
+    -H 'Content-Type: application/json'
+    -H 'Accept: application/json, text/event-stream')
+  [ -n "$session" ] && args+=(-H "mcp-session-id: ${session}")
+  # Never let a transport-level curl failure (server died, connection reset)
+  # abort the run via `set -e` — report it as a failed check instead. curl
+  # prints 000 when it never got a status line.
+  curl "${args[@]}" -d "$payload" || printf 'curl-error-%s' "$?"
+}
+
+INIT_PAYLOAD='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke-test","version":"0"}}}'
+
+session_id() { tr -d '\r' < "$HEADERS" | awk 'tolower($1) == "mcp-session-id:" { print $2 }'; }
+
+# ---------------------------------------------------------------------------
+log "Phase 1: handshake + tools/list over a non-localhost Host (guard off)"
+start_container
+
+# Cheapest possible check for the wrong bind interface (127.0.0.1:8000).
+if docker logs "$CONTAINER" 2>&1 | grep -q 'Uvicorn running on http://0.0.0.0:8080'; then
+  pass "listening on 0.0.0.0:8080"
+else
+  fail "not listening on 0.0.0.0:8080 — check host/port are passed to the serve call"
+  docker logs "$CONTAINER" 2>&1 | tail -20
+fi
+
+code=$(mcp_post "$ROUTE_HOST" "$INIT_PAYLOAD")
+if [ "$code" = "200" ]; then
+  pass "initialize -> 200 (Host: ${ROUTE_HOST})"
+else
+  fail "initialize -> ${code} (Host: ${ROUTE_HOST})"
+  cat "$BODY"
+fi
+
+SESSION=$(session_id)
+if [ -z "$SESSION" ]; then
+  fail "no mcp-session-id returned — cannot continue"
+else
+  mcp_post "$ROUTE_HOST" '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$SESSION" >/dev/null
+  code=$(mcp_post "$ROUTE_HOST" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$SESSION")
+  if [ "$code" = "200" ]; then
+    pass "tools/list -> 200"
+  else
+    fail "tools/list -> ${code}"
+    cat "$BODY"
+  fi
+
+  for tool in "${EXPECTED_TOOLS[@]}"; do
+    if grep -q "\"name\":\"${tool}\"" "$BODY"; then
+      pass "tool advertised: ${tool}"
+    else
+      fail "tool missing from tools/list: ${tool}"
+      cat "$BODY"
+    fi
+  done
+fi
+
+# ---------------------------------------------------------------------------
+log "Phase 2: DNS-rebinding guard, both directions (MCP_ALLOWED_HOSTS set)"
+start_container -e "MCP_ALLOWED_HOSTS=${ROUTE_HOST}"
+
+if docker logs "$CONTAINER" 2>&1 | grep -q "DNS-rebinding guard enabled"; then
+  pass "guard reported enabled at startup"
+else
+  fail "guard not enabled — MCP_ALLOWED_HOSTS did not reach the app"
+  docker logs "$CONTAINER" 2>&1 | tail -20
+fi
+
+code=$(mcp_post "$ROUTE_HOST" "$INIT_PAYLOAD")
+if [ "$code" = "200" ]; then
+  pass "allowlisted Host accepted -> 200"
+else
+  fail "allowlisted Host rejected -> ${code} (expected 200)"
+  cat "$BODY"
+fi
+
+code=$(mcp_post "$FOREIGN_HOST" "$INIT_PAYLOAD")
+if [ "$code" = "421" ]; then
+  pass "foreign Host rejected -> 421"
+else
+  fail "foreign Host -> ${code} (expected 421 — the guard is not actually guarding)"
+  cat "$BODY"
+fi
+
+# ---------------------------------------------------------------------------
+# REQUIRE_POMERIUM_IDENTITY=true serves through a second, separate code path
+# (`streamable_http_app()` + uvicorn) that needs its own bind address and
+# security settings. Missing either breaks only this posture, so exercise it.
+log "Phase 3: identity-gate serve path (REQUIRE_POMERIUM_IDENTITY=true)"
+start_container \
+  -e REQUIRE_POMERIUM_IDENTITY=true \
+  -e POMERIUM_JWKS_URL=https://jwks.invalid/jwks.json \
+  -e "MCP_ALLOWED_HOSTS=${ROUTE_HOST}"
+
+if docker logs "$CONTAINER" 2>&1 | grep -q 'Uvicorn running on http://0.0.0.0:8080'; then
+  pass "listening on 0.0.0.0:8080"
+else
+  fail "not listening on 0.0.0.0:8080 — check host is passed to the app builder"
+  docker logs "$CONTAINER" 2>&1 | tail -20
+fi
+
+# No valid assertion is obtainable here (that needs a live Pomerium), so assert
+# the gate rejects rather than that it admits: 401 proves the request reached
+# the app's middleware, which is what a wrong bind would prevent.
+code=$(mcp_post "$ROUTE_HOST" "$INIT_PAYLOAD")
+if [ "$code" = "401" ]; then
+  pass "unauthenticated /mcp rejected -> 401"
+else
+  fail "unauthenticated /mcp -> ${code} (expected 401)"
+  cat "$BODY"
+fi
+
+# ---------------------------------------------------------------------------
+if [ "$failures" -gt 0 ]; then
+  printf '\nsmoke test FAILED (%d check(s))\n' "$failures"
+  exit 1
+fi
+printf '\nsmoke test passed\n'

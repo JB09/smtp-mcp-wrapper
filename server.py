@@ -16,7 +16,8 @@ import smtplib
 from email.message import EmailMessage
 from email.utils import formataddr
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -63,7 +64,54 @@ STARTUP_TEST_EMAIL = os.environ.get("STARTUP_TEST_EMAIL", "false").lower() == "t
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 
-mcp = FastMCP("email-mcp", host=HOST, port=PORT)
+# DNS-rebinding protection (MCP SDK 2.x). The SDK checks the `Host` header on
+# /mcp and answers 421 when it is not allowlisted. Note this must be what the
+# proxy actually *sends* upstream, which is usually the container address
+# (`email-mcp:8080`) rather than the public route — most proxies rewrite `Host`
+# unless configured to preserve it. Entries match literally; use `host:*` to
+# allow any port. Leave empty to keep the guard off (the pre-2.x posture), in
+# which case the authorization proxy is the only `Host` check.
+MCP_ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
+]
+# Allowed `Origin` values for browser-originated requests. Defaults to https://
+# on each allowed host when unset.
+MCP_ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
+
+mcp = MCPServer("email-mcp")
+
+
+def _transport_security() -> TransportSecuritySettings:
+    """Build the DNS-rebinding guard settings for the streamable-HTTP transport.
+
+    Allowlisting is the recommended posture; disabling wholesale re-creates
+    CVE-2025-66416. The guard defaults to *off with a warning* when
+    MCP_ALLOWED_HOSTS is unset so that an SDK upgrade alone can never take a
+    working deployment offline — it is opt-in.
+
+    Passing an explicit settings object also matters when HOST is loopback: the
+    SDK would otherwise auto-install a localhost-only allowlist.
+    """
+    if not MCP_ALLOWED_HOSTS:
+        logger.warning(
+            "MCP_ALLOWED_HOSTS is not set — DNS-rebinding guard disabled. Set it to the "
+            "Host header the proxy actually sends upstream (e.g. email-mcp:8080) to enable."
+        )
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    origins = MCP_ALLOWED_ORIGINS or [f"https://{h}" for h in MCP_ALLOWED_HOSTS]
+    logger.info(
+        "DNS-rebinding guard enabled — allowed hosts: %s; allowed origins: %s",
+        ", ".join(MCP_ALLOWED_HOSTS),
+        ", ".join(origins),
+    )
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=MCP_ALLOWED_HOSTS,
+        allowed_origins=origins,
+    )
 
 
 def _build_message(
@@ -267,7 +315,12 @@ def _run_with_identity_gate() -> None:
     from starlette.concurrency import run_in_threadpool
     from starlette.middleware.base import BaseHTTPMiddleware
 
-    app = mcp.streamable_http_app()
+    # The guard settings must be passed on this serve path too — it is a
+    # separate builder from `mcp.run()`, and its default is a loopback-only
+    # allowlist that would 421 every proxied request. `host` only selects that
+    # default (so it is redundant while settings are explicit); pass it anyway
+    # so the two stay consistent. uvicorn below does the actual binding.
+    app = mcp.streamable_http_app(host=HOST, transport_security=_transport_security())
 
     async def require_identity(request: Request, call_next):
         if request.url.path.startswith("/mcp"):
@@ -315,4 +368,11 @@ if __name__ == "__main__":
             raise SystemExit(1)
         _run_with_identity_gate()
     else:
-        mcp.run(transport="streamable-http")
+        # SDK 2.x takes the bind address on `run()`, not the constructor. Omit
+        # them and it silently binds 127.0.0.1:8000 — unreachable in a container.
+        mcp.run(
+            transport="streamable-http",
+            host=HOST,
+            port=PORT,
+            transport_security=_transport_security(),
+        )

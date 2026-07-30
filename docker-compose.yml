@@ -22,6 +22,10 @@ services:
       DEFAULT_TO: ${DEFAULT_TO:-}
       ALLOWED_TO: ${ALLOWED_TO:-}
       STARTUP_TEST_EMAIL: ${STARTUP_TEST_EMAIL:-false}
+      # DNS-rebinding guard. Must be the Host the proxy actually sends upstream
+      # (usually `email-mcp:8080`, not the public route). Empty = guard off.
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
       REQUIRE_POMERIUM_IDENTITY: ${REQUIRE_POMERIUM_IDENTITY:-false}
       POMERIUM_IDENTITY_HEADER: ${POMERIUM_IDENTITY_HEADER:-x-pomerium-assertion,x-pomerium-jwt-assertion}
       POMERIUM_JWKS_URL: ${POMERIUM_JWKS_URL:-}

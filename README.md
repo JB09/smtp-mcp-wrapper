@@ -62,6 +62,8 @@ the published container image can safely be public.
 | `POMERIUM_AUDIENCE` | — | Expected `aud` claim (the route host/URL). Verified when set — strongly recommended. |
 | `POMERIUM_ISSUER` | — | Expected `iss` claim. Verified only when set. |
 | `POMERIUM_IDENTITY_HEADER` | `x-pomerium-assertion,x-pomerium-jwt-assertion` | Comma-separated header(s) carrying the assertion JWT. |
+| `MCP_ALLOWED_HOSTS` | — | Comma-separated `Host` allowlist for `/mcp` (DNS-rebinding guard). Empty = guard off. See [below](#dns-rebinding-guard-host-allowlist). |
+| `MCP_ALLOWED_ORIGINS` | `https://<each allowed host>` | Comma-separated `Origin` allowlist for browser-originated requests. |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Server bind address/port. |
 
 ### The `send_email` tool
@@ -72,6 +74,45 @@ send_email(subject: str, html: str, to?: str, text?: str) -> str
 
 Sends an HTML email. `to` falls back to `DEFAULT_TO` and must be within `ALLOWED_TO` when
 that allowlist is set. `text` is an optional plain-text alternative for non-HTML clients.
+
+## DNS-rebinding guard (`Host` allowlist)
+
+MCP SDK 2.x checks the `Host` header on every `/mcp` request and answers **421 Misdirected
+Request** when it is not allowlisted ([CVE-2025-66416] made this on by default). This
+server leaves it **off unless `MCP_ALLOWED_HOSTS` is set**, so an SDK upgrade alone can
+never take a working deployment offline — you opt in.
+
+> ⚠️ **The allowlist is not your public hostname.** Pomerium — like most reverse proxies by
+> default — rewrites `Host` to the upstream address before forwarding. The route may be
+> `https://email-mcp.example.com`, but what the container receives is `Host: email-mcp:8080`.
+> Allowlisting the public name still 421s.
+
+Find what actually arrives rather than guessing: in Pomerium's access log, the `authority`
+field on the `http-request` line is the `Host` the upstream sees (the `host` field on the
+`authorize check` line is the public route). This varies per route in the same Pomerium
+instance, so check this one.
+
+```sh
+MCP_ALLOWED_HOSTS=email-mcp:8080
+```
+
+Then redeploy and confirm the startup line names it:
+
+```
+DNS-rebinding guard enabled — allowed hosts: email-mcp:8080; ...
+INFO:     Uvicorn running on http://0.0.0.0:8080
+```
+
+Matching is literal — a bare `example.com` will **not** match a `Host` carrying a port; use
+`example.com:*` for any port. Alternatively set `preserve_host_header: true` on the
+Pomerium route and allowlist the public name instead.
+
+**Verify with a real tool call, not the healthcheck.** `/healthz` is not behind the guard,
+so a container answering `healthy` proves nothing — a misconfigured allowlist shows up only
+as a 421 on `POST /mcp`. `scripts/smoke_test.sh` automates exactly this check and runs in
+CI before any image is pushed.
+
+[CVE-2025-66416]: https://advisories.gitlab.com/pypi/mcp/CVE-2025-66416/
 
 ## Enabling app-layer verification
 
@@ -142,6 +183,13 @@ Patches flow with near-zero manual effort:
   `main`, on Dependabot PRs, via manual dispatch, and **weekly (Mon 06:00 UTC) with
   `no-cache`** so the OS and Python patches are genuinely refreshed even without code
   changes.
+- **Smoke test** (`scripts/smoke_test.sh`) runs against the built image *before* the push
+  step, driving a real MCP `initialize` + `tools/list` over a non-localhost `Host`. This is
+  what makes an unattended SDK bump safe to merge: the failures an MCP SDK upgrade actually
+  causes — binding the wrong interface, or a `Host` allowlist that rejects the proxy —
+  produce an image that builds and reports **healthy** while every tool call fails, so a
+  build-only gate would wave them straight through. Run it locally with
+  `./scripts/smoke_test.sh <image>`.
 - On the host, pull the rebuilt image with [Watchtower](https://containrrr.dev/watchtower/)
   (the compose file already sets the opt-in label) or a cron running
   `docker compose pull && docker compose up -d`.
