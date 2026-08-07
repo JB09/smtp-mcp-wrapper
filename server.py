@@ -16,6 +16,7 @@ import smtplib
 from email.message import EmailMessage
 from email.utils import formataddr
 
+from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
@@ -80,7 +81,22 @@ MCP_ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get("MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()
 ]
 
-mcp = MCPServer("email-mcp")
+# How long (ms) a client may reuse a cached `tools/list` result. The catalog is
+# registered at import time and cannot change while the process runs, so the
+# only thing that invalidates it is a restart on a new image.
+TOOLS_LIST_TTL_MS = int(os.environ.get("TOOLS_LIST_TTL_MS", str(60 * 60 * 1000)))
+
+mcp = MCPServer(
+    "email-mcp",
+    title="Email (SMTP)",
+    website_url="https://github.com/JB09/smtp-mcp-wrapper",
+    # `cacheScope: public` (MCP 2026-07-28) says a cached result may be shared
+    # across authorization contexts. That holds here — the catalog is static and
+    # identical for every caller, so no identity-specific data can leak through a
+    # shared cache entry. If a tool is ever registered conditionally on who is
+    # asking, this must become "private".
+    cache_hints={"tools/list": CacheHint(ttl_ms=TOOLS_LIST_TTL_MS, scope="public")},
+)
 
 
 def _transport_security() -> TransportSecuritySettings:

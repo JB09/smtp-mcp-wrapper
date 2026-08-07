@@ -154,10 +154,80 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Everything above drives the *legacy* protocol: an `initialize` handshake and
+# the Mcp-Session-Id it returns. The SDK picks the era per request from the
+# MCP-Protocol-Version header, so a 2026-07-28 client takes a different code
+# path entirely — one self-contained POST, no handshake, no session. Without
+# this, an SDK bump could break every modern client while CI stays green.
+# Reuses phase 2's container, so it also proves the modern path works with the
+# Host guard on.
+log "Phase 3: modern stateless request path (MCP-Protocol-Version: 2026-07-28)"
+
+MODERN_VERSION="2026-07-28"
+# With no handshake, what `initialize` used to establish rides on every request
+# in a params._meta envelope instead. All three keys are required — omit them
+# and the server answers 400 (-32602).
+MODERN_META='"_meta":{'
+MODERN_META+='"io.modelcontextprotocol/protocolVersion":"'"$MODERN_VERSION"'",'
+MODERN_META+='"io.modelcontextprotocol/clientCapabilities":{},'
+MODERN_META+='"io.modelcontextprotocol/clientInfo":{"name":"smoke-test","version":"0"}}'
+
+# mcp_post takes a session, not arbitrary headers; the modern path needs the
+# routing headers instead, so it gets its own poster.
+mcp_post_modern() {
+  local host="$1" method="$2" payload="$3"
+  curl -s -o "$BODY" -D "$HEADERS" -w '%{http_code}' -X POST "${BASE}/mcp" \
+    -H "Host: ${host}" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H "MCP-Protocol-Version: ${MODERN_VERSION}" \
+    -H "Mcp-Method: ${method}" \
+    -d "$payload" || printf 'curl-error-%s' "$?"
+}
+
+code=$(mcp_post_modern "$ROUTE_HOST" "tools/list" \
+  "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{${MODERN_META}}}")
+if [ "$code" = "200" ]; then
+  pass "sessionless tools/list -> 200"
+else
+  fail "sessionless tools/list -> ${code} (expected 200)"
+  cat "$BODY"
+fi
+
+# The point of the modern path is that there is no protocol session to store; a
+# session id coming back means the request fell through to the legacy handler.
+if [ -n "$(session_id)" ]; then
+  fail "modern request returned an mcp-session-id — it was served by the legacy path"
+else
+  pass "no mcp-session-id returned"
+fi
+
+# server.py declares a cache hint for tools/list; a client that never sees it
+# silently re-fetches the catalog on every reconnect.
+if grep -q '"ttlMs"' "$BODY" && grep -q '"cacheScope":"public"' "$BODY"; then
+  pass "tools/list carries the cache hint (ttlMs + cacheScope)"
+else
+  fail "tools/list result is missing ttlMs/cacheScope"
+  cat "$BODY"
+fi
+
+# 2026-07-28 requires Mcp-Method (and Mcp-Name) to mirror the body so gateways
+# can route on headers alone; the SDK rejects a mismatch with -32020. That
+# guarantee is what makes per-tool proxy policy safe to write.
+code=$(mcp_post_modern "$ROUTE_HOST" "tools/list" \
+  "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"send_email\",\"arguments\":{},${MODERN_META}}}")
+if [ "$code" = "400" ] && grep -q '\-32020' "$BODY"; then
+  pass "Mcp-Method disagreeing with the body -> 400 (-32020)"
+else
+  fail "header/body mismatch -> ${code} (expected 400 with -32020)"
+  cat "$BODY"
+fi
+
+# ---------------------------------------------------------------------------
 # REQUIRE_POMERIUM_IDENTITY=true serves through a second, separate code path
 # (`streamable_http_app()` + uvicorn) that needs its own bind address and
 # security settings. Missing either breaks only this posture, so exercise it.
-log "Phase 3: identity-gate serve path (REQUIRE_POMERIUM_IDENTITY=true)"
+log "Phase 4: identity-gate serve path (REQUIRE_POMERIUM_IDENTITY=true)"
 start_container \
   -e REQUIRE_POMERIUM_IDENTITY=true \
   -e POMERIUM_JWKS_URL=https://jwks.invalid/jwks.json \
