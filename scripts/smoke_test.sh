@@ -38,6 +38,25 @@ fail() { printf '  FAIL %s\n' "$*"; failures=$((failures + 1)); }
 cleanup() { docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+# Wait for a line to appear in the container log. Returns 1 if it never does.
+#
+# The app writes these lines before uvicorn binds, so by the time /healthz
+# answers they have certainly been *written* — but the daemon's log pipeline
+# lags by a few milliseconds, and a single `docker logs | grep` loses that race
+# on a loaded runner. It did on 2026-08-24: the guard-enabled grep missed a line
+# that the failure dump printed 12ms later, in a run whose other checks (foreign
+# Host -> 421) proved the guard was working. Polling keeps the assertion honest
+# — a genuinely missing line still fails, just after the timeout instead of
+# instantly.
+wait_for_log() {
+  local pattern="$1" deadline=$((SECONDS + ${2:-10}))
+  while :; do
+    if docker logs "$CONTAINER" 2>&1 | grep -q -- "$pattern"; then return 0; fi
+    if [ "$SECONDS" -ge "$deadline" ]; then return 1; fi
+    sleep 0.2
+  done
+}
+
 start_container() {
   cleanup
   # Credentials are dummies on purpose — no phase sends mail, and STARTUP_TEST_EMAIL
@@ -88,7 +107,7 @@ log "Phase 1: handshake + tools/list over a non-localhost Host (guard off)"
 start_container
 
 # Cheapest possible check for the wrong bind interface (127.0.0.1:8000).
-if docker logs "$CONTAINER" 2>&1 | grep -q 'Uvicorn running on http://0.0.0.0:8080'; then
+if wait_for_log 'Uvicorn running on http://0.0.0.0:8080'; then
   pass "listening on 0.0.0.0:8080"
 else
   fail "not listening on 0.0.0.0:8080 — check host/port are passed to the serve call"
@@ -130,7 +149,7 @@ fi
 log "Phase 2: DNS-rebinding guard, both directions (MCP_ALLOWED_HOSTS set)"
 start_container -e "MCP_ALLOWED_HOSTS=${ROUTE_HOST}"
 
-if docker logs "$CONTAINER" 2>&1 | grep -q "DNS-rebinding guard enabled"; then
+if wait_for_log "DNS-rebinding guard enabled"; then
   pass "guard reported enabled at startup"
 else
   fail "guard not enabled — MCP_ALLOWED_HOSTS did not reach the app"
@@ -233,7 +252,7 @@ start_container \
   -e POMERIUM_JWKS_URL=https://jwks.invalid/jwks.json \
   -e "MCP_ALLOWED_HOSTS=${ROUTE_HOST}"
 
-if docker logs "$CONTAINER" 2>&1 | grep -q 'Uvicorn running on http://0.0.0.0:8080'; then
+if wait_for_log 'Uvicorn running on http://0.0.0.0:8080'; then
   pass "listening on 0.0.0.0:8080"
 else
   fail "not listening on 0.0.0.0:8080 — check host is passed to the app builder"
